@@ -1,0 +1,7 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/Net-OpenSSH-Parallel.t
+lib/Net/OpenSSH/Parallel.pm
+META.yml                                 Module meta-data (added by MakeMaker)
