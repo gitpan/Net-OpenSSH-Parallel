@@ -3,5 +3,7 @@ Makefile.PL
 MANIFEST
 README
 t/Net-OpenSSH-Parallel.t
+t/pods.t
 lib/Net/OpenSSH/Parallel.pm
+lib/Net/OpenSSH/Parallel/Constants.pm
 META.yml                                 Module meta-data (added by MakeMaker)
