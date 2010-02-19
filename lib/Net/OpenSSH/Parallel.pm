@@ -1,6 +1,6 @@
 package Net::OpenSSH::Parallel;
 
-our $VERSION = '0.03';
+our $VERSION = '0.05';
 
 use strict;
 use warnings;
@@ -490,7 +490,7 @@ sub _at_ready {
 	    my %opts = %{shift @$task};
 	    delete $opts{on_error};
 	    my $method = "_start_$action";
-	    my $pid = $self->$method($label, @$task);
+	    my $pid = $self->$method($label, \%opts, @$task);
 	    $debug and _debug(action => "[$label] action pid: ", $pid);
 	    unless (defined $pid) {
 		$self->_at_error($label, $host->{ssh}->error || OSSH_SLAVE_FAILED);
@@ -727,7 +727,7 @@ Run this here, that there, etc.
   *** remain compatible with this one.
   ***
 
-C<Net::OpenSSH::Parallel> is a scheduler that can run commands in
+C<Net::OpenSSH::Parallel> is an scheduler that can run commands in
 parallel in a set of hosts through SSH. It tries to find a compromise
 between being simple to use, efficient and covering a good part of the
 problem space of parallel process execution via SSH.
@@ -762,7 +762,7 @@ everything!
 =head2 Labelling hosts
 
 Every host is identified by an unique label that is given when the
-host is registered into the parallel scheduller. Usually, the host
+host is registered into the parallel scheduler. Usually, the host
 name is used also as the label, but this is not required by the
 module.
 
@@ -915,9 +915,9 @@ The default policy is C<OSSH_ON_ERROR_ABORT>.
 
 =head3 Setting the policy dynamically
 
-When a code reference is used instead of the previous constants as the
-police, the given subroutine will be called on error conditions as
-follows:
+When a subroutine reference is used as the policy instead of the any of the
+constants previously described, the given subroutine will be called on
+error conditions as follows:
 
   $on_error->($pssh, $label, $error, $task)
 
@@ -928,11 +928,11 @@ L<Net::OpenSSH::Parallel::Constants> and $task is a reference to the
 task that was being carried out.
 
 The return value of the subroutine must be one of the described
-constants and the corresponding policy will be followed afterwards.
+constants and the corresponding policy will be applied.
 
 =head3 Retrying connection errors
 
-When the module fails when trying to stablish a new SSH connection or
+If the module fails when trying to stablish a new SSH connection or
 when an existing connection dies unexpectedly, the option
 C<reconnections> can be used to instruct the module to retry the
 connection until it succeds or the given maximun is reached.
@@ -1048,7 +1048,7 @@ Queues a call to a perl subroutine that will be executed locally.
 
 =back
 
-When given, the C<\%opts> argument can contain the following options:
+When given, C<%opts> can contain the following options:
 
 =over 4
 
@@ -1110,6 +1110,10 @@ log the operations performed in a given file
 add support for better handling of the Net::OpenSSH stdio redirection
 facilities
 
+=item * configurable valid return codes
+
+Non zero exit code is not always an error.
+
 =back
 
 =head1 BUGS AND SUPPORT
@@ -1134,6 +1138,11 @@ run it. Include also the source code of the script, a description of
 what is going wrong and the details of your OS and the versions of
 Perl, C<Net::OpenSSH> and C<Net::OpenSSH::Parallel> you are using.
 
+=head2 Development version
+
+The source code for this module is hosted at GitHub:
+L<http://github.com/salva/p5-Net-OpenSSH-Parallel>.
+
 =head2 Commercial support
 
 Commercial support, professional services and custom software
@@ -1141,10 +1150,10 @@ development around this module are available through my current
 company. Drop me an email with a rough description of your
 requirements and we will get back to you ASAP.
 
-=head2 Development version
+=head2 My wishlist
 
-The source code for this module is hosted at GitHub:
-L<http://github.com/salva/p5-Net-OpenSSH-Parallel>.
+If you like this module and you're feeling generous, take a look at my
+Amazon Wish List: L<http://amzn.com/w/1WU1P6IR5QZ42>
 
 =head1 SEE ALSO
 
@@ -1157,13 +1166,17 @@ simpler to use but rather more limited.
 L<GRID::Machine> allows to run perl code distributed in a cluster via
 SSH.
 
-If your application requires orchestating workflows more complex that
+If your application requires orchestating workflows more complex than
 those supported by L<Net::OpenSSH::Parallel>, you should probably
-consider some L<POE> based solution.
+consider some L<POE> based solution (check
+L<POE::Component::OpenSSH>).
+
+L<App::MrShell> is another module allowing to run the same command in
+several host in parallel.
 
 =head1 COPYRIGHT AND LICENSE
 
-Copyright E<copy> 2009 by Salvador FandiE<ntilde>o
+Copyright E<copy> 2009-2010 by Salvador FandiE<ntilde>o
 (sfandino@yahoo.com).
 
 This library is free software; you can redistribute it and/or modify
