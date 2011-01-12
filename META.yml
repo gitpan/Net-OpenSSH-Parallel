@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Net-OpenSSH-Parallel
-version:            0.08
+version:            0.09
 abstract:           ~
 author:
     - Salvador Fandino <sfandino@yahoo.com>
