@@ -1,10 +1,10 @@
 package Net::OpenSSH::Parallel;
 
-our $VERSION = '0.10';
+our $VERSION = '0.11';
 
 use strict;
 use warnings;
-use Carp qw(croak carp verbose);
+use Carp qw(croak carp);
 
 use Net::OpenSSH;
 use Net::OpenSSH::Parallel::Constants qw(:error :on_error);
@@ -147,10 +147,26 @@ sub _select_labels {
     return @labels;
 }
 
-my %action_alias = (get  => 'scp_get',
-		    put  => 'scp_put',
-                    psub => 'parsub',
-		    cmd  => 'command');
+sub all { shift->push('*', @_) }
+
+my %push_action_alias = (get  => 'scp_get',
+                         put  => 'scp_put',
+                         psub => 'parsub',
+                         cmd  => 'command');
+
+my %push_min_args = ( here      => 1,
+                      goto      => 1,
+                      stop      => 0,
+                      sub       => 1,
+                      parsub    => 1,
+                      scp_get   => 2,
+                      scp_put   => 2,
+                      rsync_get => 2,
+                      rsync_put => 2 );
+
+my %push_max_args =  ( here     => 1,
+                       goto     => 1,
+                       stop     => 0 );
 
 sub push {
     my $self = shift;
@@ -163,18 +179,27 @@ sub push {
 	$action = 'sub';
     }
 
-    my $alias = $action_alias{$action};
+    my $alias = $push_action_alias{$action};
     $action = $alias if defined $alias;
 
-    $action =~ /^(?:command|(?:(?:rsync|scp)_(?:get|put))|join|sub|parsub|_notify)$/
+    $action =~ /^(?:command|(?:(?:rsync|scp)_(?:get|put))|join|sub|parsub|here|stop|goto|_notify)$/
 	or croak "bad action '$action'";
 
     my %opts = (($action ne 'sub' and ref $_[0] eq 'HASH') ? %{shift()} : ());
+    %opts and grep($action eq $_, qw(join here))
+        and croak "unsupported option(s) '" . join("', '", keys %opts) . "' in $action action";
 
     my @labels = $self->_select_labels($selector);
 
+    my $max = $push_max_args{$action};
+    croak "too many parameters for action $action"
+        if (defined $max and $max < @_);
+
+    my $min = $push_min_args{$action};
+    croak "too few parameters for action $action"
+        if (defined $min and $min > @_);
+
     if ($action eq 'join') {
-	keys %opts and croak "join action does not accept options";
 	my $notify_selector = shift @_;
 	my $join = { id => '#' . $self->{join_seq}++,
 		     depends => {},
@@ -203,7 +228,7 @@ sub push {
 		if $in_state->{done}{$label};
 	}
     }
-    return @labels;
+    @labels;
 }
 
 sub _audit_conns {
@@ -265,7 +290,8 @@ sub _at_error {
 	}
     }
 
-    $on_error ||= OSSH_ON_ERROR_ABORT;
+    $on_error = OSSH_ON_ERROR_ABORT if (not defined $on_error or
+                                        $error == OSSH_ABORTED);
 
     $debug and _debug(error => "[$label] on_error (final): $on_error, error: $error (".($error+0).")");
 
@@ -277,7 +303,13 @@ sub _at_error {
 	    $self->_disconnect_host($label);
 	    $self->_set_host_state($label, 'ready');
 	}
-	else {
+	elsif ($error == OSSH_GOTO_FAILED) {
+            # No way to retry after a GOTO error!
+            # That should probably croak, but that would leave unmanaged
+            # processes running
+            $on_error = OSSH_ON_ERROR_ABORT;
+        }
+        else {
 	    unshift @$queue, $task;
 	}
 	return;
@@ -300,9 +332,13 @@ sub _at_error {
 	}
 	# else do nothing
     }
-    elsif ($on_error == OSSH_ON_ERROR_DONE or
-	   $on_error == OSSH_ON_ERROR_ABORT or
-	   $on_error == OSSH_ON_ERROR_ABORT_ALL) {
+    else {
+        unless ($on_error == OSSH_ON_ERROR_DONE or
+                $on_error == OSSH_ON_ERROR_ABORT or
+                $on_error == OSSH_ON_ERROR_ABORT_ALL) {
+            carp "bad on_error code $on_error";
+            $on_error = OSSH_ON_ERROR_ABORT;
+        }
 	my $queue = $host->{queue};
 	my $failed = ($on_error != OSSH_ON_ERROR_DONE);
 	$debug and _debug(error => "[$label] dropping queue, ", scalar(@$queue), " jobs");
@@ -319,9 +355,6 @@ sub _at_error {
 	$self->_set_host_state($label, 'done');
 	$self->_disconnect_host($label);
 	$host->{error} = $error;
-    }
-    else {
-	die "unknown on_error code $on_error"
     }
 }
 
@@ -421,6 +454,8 @@ sub _disconnect_any_host {
     $self->_disconnect_host($label);
 }
 
+my @private_opts = qw(on_error or_goto);
+
 sub _at_ready {
     my ($self, $label) = @_;
     if (my $max_workers = $self->{max_workers}) {
@@ -438,6 +473,12 @@ sub _at_ready {
     $debug and _debug(at => "[$label] at_ready");
 
     my $queue = $host->{queue};
+
+    if ($self->{abort_all}) {
+        $self->_at_error($label, OSSH_ABORTED);
+        return;
+    }
+
     while (defined (my $task = shift @$queue)) {
 	my $action = shift @$task;
 	$debug and _debug(at => "[$label] at_ready, starting new action $action");
@@ -456,6 +497,18 @@ sub _at_ready {
 	    $self->_set_host_state($label, 'waiting');
 	    return;
 	}
+        elsif ($action eq 'here') {
+            next;
+        }
+        elsif ($action eq 'stop') {
+            $self->_skip($label, 'END');
+            next;
+        }
+        elsif ($action eq 'goto') {
+            my (undef, $target) = @$task;
+            $self->_skip($label, $target);
+            next;
+        }
 	elsif ($action eq '_notify') {
 	    my (undef, $join) = @$task;
 	    $self->_join_notify($label, $join);
@@ -493,9 +546,10 @@ sub _at_ready {
 
             $host->{current_task} = [$action, @$task];
             my %opts = %{shift @$task};
-            delete $opts{on_error};
-            my $method = "_start_$action";
-            my $pid = $self->$method($label, \%opts, @$task);
+            delete @opts{@private_opts};
+            my $method = $self->can("_start_$action")
+                or die "internal error: method _start_$action not found";
+            my $pid = $method->($self, $label, \%opts, @$task);
             $debug and _debug(action => "[$label] action pid: ", $pid);
             unless (defined $pid) {
                 my $error = (($ssh && $ssh->error) ||
@@ -588,44 +642,68 @@ sub _start_join {
     warn "internal mismatch: this shouldn't be happening!";
 }
 
+sub _skip {
+    my ($self, $label, $target) = @_;
+    $debug and _debug(action => "skipping until $target");
+    my $host = $self->{hosts}{$label};
+    my $queue = $host->{queue};
+    my ($ix, $task);
+    for ($ix = 0; defined($task = $queue->[$ix]); $ix++) {
+        last if ($task->[0] eq 'here' and $task->[2] eq $target);
+    }
+    if ($task or $target eq 'END') {
+        for (1..$ix) {
+            my $task = shift @$queue;
+            $self->_join_notify($label, $task->[2])
+                if $task->[0] eq '_notify';
+        }
+        return;
+    }
+    $debug and _debug(action => "here label $target not found");
+    $self->_at_error($label, OSSH_GOTO_FAILED);
+}
+
 sub _finish_task {
     my ($self, $pid) = @_;
     my $label = delete $self->{host_by_pid}{$pid};
+
     if (defined $label) {
 	$debug and _debug(action => "[$label] action finished pid: $pid, rc: $?");
 	my $host = $self->{hosts}{$label};
+        my $or_goto;
         if ($?) {
             my ($action) = @{$host->{current_task}};
             my $rc = ($? >> 8);
             my $ssh = $host->{ssh} or die "internal error: $label is not connected";
-            my $error = ($ssh && $ssh->error);
-            if (!$error or $rc < 255) {
-                $error = dualvar(OSSH_SLAVE_FAILED,
-                                 "child exited with non-zero return code ($rc)");
+            my $error = $ssh->error;
+            $or_goto = $host->{current_task}[1]{or_goto} unless ($error or $rc == 255);
+            if (defined $or_goto) {
+                $debug and _debug(action => "[$label] skipping to $or_goto with rc = $rc");
             }
-	    $self->_at_error($label, $error);
-	}
-	else {
-	    $self->_set_host_state($label, 'ready');
-	    delete $host->{current_task};
-	    delete $host->{current_task_reconns};
-	}
+            else {
+                $error ||= dualvar(OSSH_SLAVE_FAILED,
+                                   "child exited with non-zero return code ($rc)");
+                $self->_at_error($label, $error);
+                return
+            }
+        }
+        $self->_set_host_state($label, 'ready');
+        $self->_skip($label, $or_goto) if defined $or_goto;
+        delete $host->{current_task};
+        delete $host->{current_task_reconns};
     }
     else {
 	my $label = delete $self->{ssh_master_by_pid}{$pid};
-	if (defined $label) {
-	    $debug and _debug(action => "[$label] master ssh exited");
-	    my $host = $self->{hosts}{$label};
-	    my $ssh = $host->{ssh}
-		or die ("internal error: master ssh process exited but ".
-			"there is no ssh object associated to host $label");
-	    $ssh->master_exited;
-	    my $state = $host->{state};
-	    # do error handler later...
-	}
-	else {
-	    carp "espourios child exit (pid: $pid)";
-	}
+	defined $label or carp "spurious child exit (pid: $pid)";
+
+        $debug and _debug(action => "[$label] master ssh exited");
+        my $host = $self->{hosts}{$label};
+        my $ssh = $host->{ssh}
+            or die ("internal error: master ssh process exited but ".
+                    "there is no ssh object associated to host $label");
+        $ssh->master_exited;
+        my $state = $host->{state};
+        # do error handler later...
     }
 }
 
@@ -723,6 +801,8 @@ sub run {
 	$self->_wait_for_jobs($time);
     }
 
+    delete $self->{abort_all};
+
     my $error;
     for my $label (sort keys %$hosts) {
 	$hosts->{$label}{error} and $error = 1;
@@ -736,6 +816,19 @@ sub get_error {
     my $host = $self->{hosts}{$label}
 	or croak "no such host $label has been added";
     $host->{error}
+}
+
+sub get_errors {
+    my $self = shift;
+    if (wantarray) {
+        return map {
+            my $error = $self->get_error($_);
+            defined $error ? ($_ => $error) : ()
+        } sort keys %{$self->{hosts}}
+    }
+    else {
+        return grep defined($self->get_error($_)), keys %{$self->{hosts}}
+    }
 }
 
 1;
@@ -937,17 +1030,15 @@ other hosts via joins.
 
 =item OSSH_ON_ERROR_ABORT_ALL
 
-B<Not implemented yet!>
-
-Causes all the host to abort as soon as possible (and that usually
-means after they finish their currently running tasks).
+Causes all the host queues to be aborted as soon as possible (and that
+usually means after currently running actions end).
 
 =item OSSH_ON_ERROR_REPEAT
 
 The module will try to perform the current task again and again until
 it succeeds. This police can lead to an infinite loop and so its
 direct usage is discouraged (but see the following point about setting
-the policy dinamically).
+the policy dynamically).
 
 =back
 
@@ -1089,6 +1180,8 @@ hosts.
 These methods queue an rsync remote file copy operation in the
 selected hosts.
 
+=item sub => sub { ... }, @extra_args
+
 =item sub { ... }, @extra_args
 
 Queues a call to a perl subroutine that will be executed locally.
@@ -1130,7 +1223,7 @@ An example of usage:
       while(<$expect>) { print };
       close $expect;
   }
-  
+
   $pssh->push('*', parsub => \&sudo_install, 'scummvm');
 
 If the subroutine dies or calls C<_exit> with a non zero return code,
@@ -1177,6 +1270,42 @@ would abort any further operation queued on server_B and any further
 operation queued after the join in server_A. See also L</Error
 handling>.
 
+=item here => $tag
+
+Push a tag in the stack that can be used as a target for goto
+operations.
+
+=item goto => $target
+
+Jumps forward until the given C<here> tag is reached.
+
+Joins to other hosts queues will be ignored, and joins from other
+queues to this one will be succesfully fulfilled. For instance:
+
+  $pssh->add_host(A => ...);
+  $pssh->add_host(B => ...);
+  $pssh->push('*', cmd  => 'echo "hello from %HOST"');
+  $pssh->push('A', goto => 'there');
+  $pssh->push('A', join => 'B');                     # ignored by A on goto
+  $pssh->push('B', join => 'A');                     # fulfilled by A on goto
+  $pssh->push('*', cmd  => 'echo "hello from %HOST% again"');
+  $pssh->push('*', here => 'there');
+  $pssh->push('*', cmd  => 'echo "bye bye from %HOST%");
+
+Note that it is not possible to jump backguards.
+
+There is an special target C<END> that can be used to jump to the end
+of the queue.
+
+=item stop
+
+Discards any additional operations queued. Any pending joins will be
+successfully fulfilled.
+
+It is equivalent to
+
+  $pssh->push('*', goto => 'END');
+
 =back
 
 When given, C<%opts> can contain the following options:
@@ -1188,6 +1317,22 @@ When given, C<%opts> can contain the following options:
 =item on_error => sub { ... }
 
 See L</Error handling>.
+
+=item or_goto => $tag
+
+Supported for C<command>, C<scp_get>, C<scp_put>, C<rsync_get> and
+C<rsync_put>, when the command, scp or rsync operation fails a goto to
+the given target is performed.
+
+For instance:
+
+  $pssh->all(command => { or_goto => 'no_file' },
+                        "test -f /etc/foo");
+  $pssh->all(scp_get => "/etc/foo", "/tmp/foo-%LABEL%");
+  $pssh->all(here    => "no_file");
+
+Failures related to SSH errors do not trigger the goto but the error
+handling code.
 
 =item timeout => $seconds
 
@@ -1203,6 +1348,14 @@ Any other option will be passed to the corresponding L<Net::OpenSSH>
 method (L<spawn|Net::OpenSSH/spawn>, L<scp_put|Net::OpenSSH/scp_put>,
 etc.).
 
+=item $pssh->all($action => @args)
+
+=item $pssh->all($action => \%opts, @args)
+
+Shortcut for...
+
+  $pssh->push('*', $action, \%opts, @args);
+
 =item $pssh->run
 
 Runs the queued operations.
@@ -1212,6 +1365,12 @@ It returns a true value on success and false otherwise.
 =item $pssh->get_error($label)
 
 Returns the last error associated to the host of the given label.
+
+=item $pssh->get_errors
+
+In list context returns a list of pairs C<$label =E<gt> $error> for the failed queues.
+
+In scalar context returns the number of failed queues.
 
 =back
 
@@ -1289,6 +1448,9 @@ requirements and we will get back to you ASAP.
 
 If you like this module and you're feeling generous, take a look at my
 Amazon Wish List: L<http://amzn.com/w/1WU1P6IR5QZ42>
+
+Also consider contributing to the OpenSSH project this module builds
+upon: L<http://www.openssh.org/donations.html>.
 
 =head1 SEE ALSO
 
