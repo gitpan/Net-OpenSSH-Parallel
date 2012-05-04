@@ -1,6 +1,6 @@
 package Net::OpenSSH::Parallel;
 
-our $VERSION = '0.11';
+our $VERSION = '0.12';
 
 use strict;
 use warnings;
@@ -19,7 +19,7 @@ sub new {
     my ($class, %opts) = @_;
     my $max_workers = delete $opts{workers};
     my $max_conns = delete $opts{connections};
-    my $max_reconns = delete $opts{reconnections};
+    my $reconnections = delete $opts{reconnections};
     my $on_error = delete $opts{on_error};
 
     if ($max_conns) {
@@ -55,7 +55,7 @@ sub new {
 		 max_workers => $max_workers,
 		 max_conns => $max_conns,
 		 num_conns => 0,
-		 max_reconns => $max_reconns,
+		 reconnections => $reconnections,
 		 on_error => $on_error,
 	       };
     bless $self, $class;
@@ -82,9 +82,10 @@ sub add_host {
     $label =~ /([,*!()<>\/{}])/ and croak "invalid char '$1' in host label";
     my %opts = (@_ & 1 ? (host => @_) : @_);
     $opts{host} = $label unless defined $opts{host};
+    $opts{batch_mode} = 1 unless defined $opts{batch_mode};
 
     my $on_error = delete $opts{on_error};
-    my $max_reconns = delete $opts{reconnections};
+    my $reconnections = delete $opts{reconnections};
 
     my $host = { label => $label,
 		 workers => 1,
@@ -93,7 +94,7 @@ sub add_host {
 		 state => 'done',
 		 queue => [],
 		 on_error => $on_error,
-		 max_reconns => $max_reconns,
+		 reconnections => $reconnections,
 	       };
 
     $self->{hosts}{$label} = $host;
@@ -263,6 +264,7 @@ sub _at_error {
     my ($self, $label, $error) = @_;
     my $host = $self->{hosts}{$label};
     my $task = delete $host->{current_task};
+    my $queue = $host->{queue};
 
     $debug and _debug(error => "_at_error label: $label, error: $error");
 
@@ -271,10 +273,15 @@ sub _at_error {
 
     my $on_error;
     if ($error == OSSH_MASTER_FAILED) {
-	my $max_reconns = _hash_chain_get(max_reconns => $host, $self) || 0;
-	my $reconns = $host->{current_task_reconns}++ || 0;
-	$debug and _debug(error => "[$label] reconnection: $reconns, max: $max_reconns");
-	if ($reconns < $max_reconns) {
+        if ($host->{state} eq 'connecting') {
+            # task is not set in state connecting!
+            $task and die "internal error: task is defined in state connecting";
+            $opts = $queue->[0][1] if @$queue;
+        }
+	my $max_reconnections = _hash_chain_get(reconnections => $opts, $host, $self) || 0;
+	my $reconnections = $host->{current_task_reconnections}++ || 0;
+	$debug and _debug(error => "[$label] reconnection: $reconnections, max: $max_reconnections");
+	if ($reconnections < $max_reconnections) {
 	    $debug and _debug(error => "[$label] will reconnect!");
 	    $on_error = OSSH_ON_ERROR_RETRY;
 	}
@@ -295,8 +302,6 @@ sub _at_error {
 
     $debug and _debug(error => "[$label] on_error (final): $on_error, error: $error (".($error+0).")");
 
-    my $queue = $host->{queue};
-
     if ($on_error == OSSH_ON_ERROR_RETRY) {
 	if ($error == OSSH_MASTER_FAILED) {
 	    $self->_set_host_state($label, 'suspended');
@@ -315,21 +320,21 @@ sub _at_error {
 	return;
     }
 
-    delete $host->{current_task_reconns};
+    delete $host->{current_task_reconnections};
 
     if ($on_error == OSSH_ON_ERROR_IGNORE) {
-	if ($error == OSSH_JOIN_FAILED) {
-	    $self->_set_host_state($label, 'ready');
-	}
-	elsif ($error == OSSH_MASTER_FAILED) {
+	if ($error == OSSH_MASTER_FAILED) {
 	    # stablishing a new connection failed, what we should do?
-	    # currently we remove the next task from the queue and
+	    # currently we remove the current task from the queue and
 	    # continue.
-	    shift @$queue;
+	    shift @$queue unless $task;
 	    $self->_set_host_state($label, 'suspended');
 	    $self->_disconnect_host($label);
 	    $self->_set_host_state($label, 'ready');
 	}
+        else {
+	    $self->_set_host_state($label, 'ready');
+        }
 	# else do nothing
     }
     else {
@@ -454,7 +459,7 @@ sub _disconnect_any_host {
     $self->_disconnect_host($label);
 }
 
-my @private_opts = qw(on_error or_goto);
+my @private_opts = qw(on_error or_goto reconnections);
 
 sub _at_ready {
     my ($self, $label) = @_;
@@ -690,7 +695,7 @@ sub _finish_task {
         $self->_set_host_state($label, 'ready');
         $self->_skip($label, $or_goto) if defined $or_goto;
         delete $host->{current_task};
-        delete $host->{current_task_reconns};
+        delete $host->{current_task_reconnections};
     }
     else {
 	my $label = delete $self->{ssh_master_by_pid}{$pid};
@@ -1122,7 +1127,7 @@ Sets the error handling policy (see L</Error handling>).
 
 =item $pssh->add_host($label, $host, %opts)
 
-registers a new host into the C<$pssh> object.
+X<add_host>registers a new host into the C<$pssh> object.
 
 C<$label> is the name used to refer to the registered host afterwards.
 
@@ -1137,14 +1142,17 @@ The accepted options are:
 
 Sets the error handling policy (see L</Error handling>).
 
-=item max_reconns => $maximum_reconnections
+=item reconnections => $maximum_reconnections
 
-See </Retrying connection errors>.
+See L</Retrying connection errors>.
 
 =back
 
 Any additional option will be passed verbatim to the L<Net::OpenSSH>
-constructor later.
+constructor later. For instance:
+
+  $pssh->add_host($host, user => $user, password => $password);
+
 
 =item $pssh->push($selector, $action, \%opts, @action_args)
 
@@ -1374,6 +1382,49 @@ In scalar context returns the number of failed queues.
 
 =back
 
+=head1 FAQ - Frequently Asked Questions
+
+=over 4
+
+=item Running remote commands with sudo
+
+B<Q>: I need to run the remote commands with sudo that asks for a
+password. How can I do it?
+
+B<A>: First read the answer given to a similar question on
+L<Net::OpenSSH> FAQ.
+
+The problem is that Net::OpenSSH::Parallel methods do not support the
+<stdin_data> option, so you will have to use an external file.
+
+  $pssh->push('*', cmd => { stdin_file => $passwd_file },
+                   'sudo', '-Skp', '', '--', @cmd);
+
+One trick you can use if you only have one password is to use the
+C<DATA> file handle:
+
+  $pssh->push('*', cmd => { stdin_fh => \*DATA},
+              'sudo', '-Skp', '', '--', @cmd);
+  ...
+  # and at the end of your script
+  __DATA__
+  this-is-my-remote-password-for-sudo
+
+Or you can also use the C<parsub> action:
+
+  my %sudo_passwords = (host1 => "foo", ...);
+
+  sub sudo {
+    my ($label, $ssh, @cmd) = @_;
+    $ssh->system({stdin_data => "$sudo_passwords{$label}\n"},
+                 'sudo', '-Skp', '', '--', @cmd);
+  }
+
+  $pssh->push('*', parsub => \&sudo, @cmd);
+
+
+=back
+
 =head1 TODO
 
 =over
@@ -1465,15 +1516,22 @@ SSH.
 
 If your application requires orchestating workflows more complex than
 those supported by L<Net::OpenSSH::Parallel>, you should probably
-consider some L<POE> based solution (check
+consider some L<POE> or L<AnyEvent> based solution (check
 L<POE::Component::OpenSSH>).
 
 L<App::MrShell> is another module allowing to run the same command in
 several host in parallel.
 
+Some people find easier to use L<Net::OpenSSH> combined with
+L<Parallel::ForkManager>, L<threads> or L<Coro>.
+
+L<Net::SSH::Mechanize> is another framework written on top of
+L<AnyEvent> that allows to run remote commands through SSH in
+parallel.
+
 =head1 COPYRIGHT AND LICENSE
 
-Copyright E<copy> 2009-2011 by Salvador FandiE<ntilde>o
+Copyright E<copy> 2009-2012 by Salvador FandiE<ntilde>o
 (sfandino@yahoo.com).
 
 This library is free software; you can redistribute it and/or modify
